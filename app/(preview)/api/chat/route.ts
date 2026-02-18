@@ -1,14 +1,9 @@
 import { findRelevantChunks } from "@/lib/ai/search";
 import { azure } from "@ai-sdk/azure";
-import { convertToCoreMessages, streamText } from "ai";
+import { Message, convertToCoreMessages, streamText } from "ai";
 
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 30;
-
-interface RequestMessage {
-  role?: string;
-  content?: unknown;
-}
 
 const getTextFromMessageContent = (content: unknown): string => {
   if (typeof content === "string") {
@@ -40,7 +35,7 @@ const getTextFromMessageContent = (content: unknown): string => {
   return "";
 };
 
-const getLatestUserQuery = (messages: RequestMessage[]): string => {
+const getLatestUserQuery = (messages: Message[]): string => {
   for (let index = messages.length - 1; index >= 0; index -= 1) {
     const message = messages[index];
     if (message.role === "user") {
@@ -80,7 +75,7 @@ const formatRetrievedContext = (
 
 export async function POST(req: Request) {
   try {
-    const body = (await req.json()) as { messages?: RequestMessage[] };
+    const body = (await req.json()) as { messages?: Message[] };
     const messages = Array.isArray(body.messages) ? body.messages : [];
     const latestUserQuery = getLatestUserQuery(messages);
     const relevantChunks = latestUserQuery
