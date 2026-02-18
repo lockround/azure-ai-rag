@@ -1,53 +1,109 @@
-import { findRelevantContent } from "@/lib/ai/search";
+import { findRelevantChunks } from "@/lib/ai/search";
 import { azure } from "@ai-sdk/azure";
-import { convertToCoreMessages, generateObject, streamText, tool } from "ai";
-import { z } from "zod";
+import { convertToCoreMessages, streamText } from "ai";
 
 // Allow streaming responses up to 30 seconds
 export const maxDuration = 30;
 
+interface RequestMessage {
+  role?: string;
+  content?: unknown;
+}
+
+const getTextFromMessageContent = (content: unknown): string => {
+  if (typeof content === "string") {
+    return content;
+  }
+
+  if (Array.isArray(content)) {
+    return content
+      .map((part) => {
+        if (typeof part === "string") {
+          return part;
+        }
+
+        if (
+          typeof part === "object" &&
+          part !== null &&
+          "text" in part &&
+          typeof (part as { text?: unknown }).text === "string"
+        ) {
+          return (part as { text: string }).text;
+        }
+
+        return "";
+      })
+      .join(" ")
+      .trim();
+  }
+
+  return "";
+};
+
+const getLatestUserQuery = (messages: RequestMessage[]): string => {
+  for (let index = messages.length - 1; index >= 0; index -= 1) {
+    const message = messages[index];
+    if (message.role === "user") {
+      const content = getTextFromMessageContent(message.content);
+      if (content) {
+        return content;
+      }
+    }
+  }
+
+  return "";
+};
+
+const formatRetrievedContext = (
+  chunks: Array<{ id: string; text: string }>,
+  maxContextCharacters = 7000
+): string => {
+  if (chunks.length === 0) {
+    return "No relevant context was retrieved from the knowledge base.";
+  }
+
+  const contextSections: string[] = [];
+  let currentLength = 0;
+
+  for (const chunk of chunks) {
+    const section = `Source ID: ${chunk.id}\n${chunk.text}`;
+    if (currentLength + section.length > maxContextCharacters) {
+      break;
+    }
+
+    contextSections.push(section);
+    currentLength += section.length;
+  }
+
+  return contextSections.join("\n\n---\n\n");
+};
+
 export async function POST(req: Request) {
   try {
-    const { messages } = await req.json();
+    const body = (await req.json()) as { messages?: RequestMessage[] };
+    const messages = Array.isArray(body.messages) ? body.messages : [];
+    const latestUserQuery = getLatestUserQuery(messages);
+    const relevantChunks = latestUserQuery
+      ? await findRelevantChunks(latestUserQuery)
+      : [];
+    const retrievedContext = formatRetrievedContext(relevantChunks);
+
     const result = await streamText({
       model: azure(process.env.AZURE_DEPLOYMENT_NAME!),
       messages: convertToCoreMessages(messages),
       system: `You are a helpful assistant acting as the users' second brain.
-      Use tools on every request.
-      Be sure to getInformation from your knowledge base before answering any questions.
-      If a response requires multiple tools, call one tool after another without responding to the user.
-      If a response requires information from an additional tool to generate a response, call the appropriate tools in order before responding to the user.
-      ONLY respond to questions using information from tool calls.
-      If no relevant information is found in the tool calls and information fetched from the knowledge base, respond, "Sorry, I don't know."
-      Be sure to adhere to any instructions in tool calls ie. if they say to respond like "...", do exactly that.
+      Use only the retrieved context and chat history to answer.
+      If no relevant information is found in the retrieved context, respond exactly with "Sorry, I don't know."
       Keep responses short and concise. Answer in a single sentence where possible.
-      If you are unsure, use the getInformation tool and you can use common sense to reason based on the information you do have.
-      Use your abilities as a reasoning machine to answer questions based on the information you do have.
-
       Cite the sources using source ids at the end of the answer text, like 【234d987】, using the id of the source.
+      If you cannot support an answer with the retrieved context, respond exactly with "Sorry, I don't know."
 
-      Respond "Sorry, I don't know." if you are unable to answer the question using the information provided by the tools.
+      Current user query:
+      """${latestUserQuery || "No user query provided."}"""
+
+      Retrieved context:
+      """${retrievedContext}"""
     `,
-      tools: {
-        getInformation: tool({
-          description: `get information from your knowledge base to answer the user's question.`,
-          parameters: z.object({
-            question: z.string().describe("the users question"),
-            similarQuestions: z.array(z.string()).describe("similar questions to the user's question. generate 3 similar questions to the user's question."),
-          }),
-          execute: async ({ similarQuestions }: { similarQuestions: string[] }) => {
-            const results = await Promise.all(
-              similarQuestions.map(
-                async (question: string) => await findRelevantContent(question),
-                ),
-              );
-            const uniqueResults = Array.from(
-              new Map(results.flat().map((item) => [item?.text, item])).values(),
-            );
-            return uniqueResults;
-          },
-        }),
-      },
     });
 
     return result.toDataStreamResponse();
