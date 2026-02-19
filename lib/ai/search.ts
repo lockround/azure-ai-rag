@@ -133,6 +133,7 @@ export const generateEmbedding = async (value: string): Promise<number[]> => {
 export const findRelevantContent = async (
   userQuery: string
 ): Promise<SearchDocument[]> => {
+  const normalizedQuery = normalizeText(userQuery);
   const semanticConfigurationName =
     process.env.AZURE_SEARCH_SEMANTIC_CONFIGURATION_NAME;
   const titleField = process.env.AZURE_SEARCH_TITLE_FIELD || "heading";
@@ -153,24 +154,29 @@ export const findRelevantContent = async (
     ...(process.env.AZURE_SEARCH_VECTOR_FIELD ? [process.env.AZURE_SEARCH_VECTOR_FIELD] : []),
   ]);
 
+  const hasTextQuery = normalizedQuery.length > 0;
+  const hasVectorQuery = vectorFields.length > 0;
+
   const searchParameters: any = {
     top: 8,
-    queryType: "simple",
     searchMode: "all",
     searchFields: unique([titleField, ...contentFields, ...keywordFields]),
     select: unique([idField, titleField, ...contentFields, ...keywordFields]),
   };
 
-  // Conditionally add semanticSearchOptions
-  if (semanticConfigurationName) {
+  // Hybrid text side: semantic when configured, otherwise lexical simple query.
+  // This combines with vectorSearchOptions below when vector fields are configured.
+  if (hasTextQuery && semanticConfigurationName) {
     searchParameters.queryType = "semantic";
     searchParameters.semanticSearchOptions = {
       configurationName: semanticConfigurationName,
     };
+  } else if (hasTextQuery) {
+    searchParameters.queryType = "simple";
   }
 
   // Conditionally add vectorSearchOptions
-  if (vectorFields.length > 0) {
+  if (hasVectorQuery) {
     const userQueryEmbedded = await generateEmbedding(userQuery);
     searchParameters.vectorSearchOptions = {
       queries: vectorFields.map((fieldName) => ({
@@ -182,7 +188,8 @@ export const findRelevantContent = async (
     };
   }
 
-  const searchResults = await searchClient.search(userQuery, searchParameters);
+  const searchText = hasTextQuery ? normalizedQuery : "*";
+  const searchResults = await searchClient.search(searchText, searchParameters);
 
   const similarDocs: SearchDocument[] = [];
   for await (const result of searchResults.results) {
