@@ -26,17 +26,31 @@ const searchClient = new SearchClient(
 export interface SearchDocument {
   id: string;
   text: string;
+  title?: string;
+  sourceName?: string;
+  sourceNumber?: string;
   similarity?: number;
 }
 
 export interface RetrievedChunk {
   id: string;
   text: string;
+  title?: string;
+  sourceName?: string;
+  sourceNumber?: string;
   score: number;
 }
 
 const normalizeText = (value: string): string =>
   value.replace(/\s+/g, " ").trim();
+
+const parseCsvEnv = (value?: string): string[] =>
+  (value ?? "")
+    .split(",")
+    .map((item) => item.trim())
+    .filter(Boolean);
+
+const unique = (values: string[]): string[] => Array.from(new Set(values));
 
 const tokenize = (value: string): string[] =>
   normalizeText(value)
@@ -119,62 +133,101 @@ export const generateEmbedding = async (value: string): Promise<number[]> => {
 export const findRelevantContent = async (
   userQuery: string
 ): Promise<SearchDocument[]> => {
+  const semanticConfigurationName =
+    process.env.AZURE_SEARCH_SEMANTIC_CONFIGURATION_NAME;
+  const titleField = process.env.AZURE_SEARCH_TITLE_FIELD || "heading";
+  const idField = process.env.AZURE_SEARCH_ID_FIELD || "chunk_id";
+  const contentFields = unique([
+    ...parseCsvEnv(process.env.AZURE_SEARCH_CONTENT_FIELDS),
+    process.env.AZURE_SEARCH_CONTENT_FIELD || "content",
+    "objective",
+    "scope",
+  ]);
+  const keywordFields = unique([
+    ...parseCsvEnv(process.env.AZURE_SEARCH_KEYWORD_FIELDS),
+    "document_name",
+    "document_number",
+  ]);
+  const vectorFields = unique([
+    ...parseCsvEnv(process.env.AZURE_SEARCH_VECTOR_FIELDS),
+    ...(process.env.AZURE_SEARCH_VECTOR_FIELD ? [process.env.AZURE_SEARCH_VECTOR_FIELD] : []),
+  ]);
+
   const searchParameters: any = {
-    top: 5,
+    top: 8,
     queryType: "simple",
+    searchMode: "all",
+    searchFields: unique([titleField, ...contentFields, ...keywordFields]),
+    select: unique([idField, titleField, ...contentFields, ...keywordFields]),
   };
 
   // Conditionally add semanticSearchOptions
-  if (process.env.AZURE_SEARCH_SEMANTIC_CONFIGURATION_NAME) {
+  if (semanticConfigurationName) {
     searchParameters.queryType = "semantic";
     searchParameters.semanticSearchOptions = {
-      configurationName: process.env.AZURE_SEARCH_SEMANTIC_CONFIGURATION_NAME,
+      configurationName: semanticConfigurationName,
     };
   }
 
   // Conditionally add vectorSearchOptions
-  if (process.env.AZURE_SEARCH_VECTOR_FIELD) {
+  if (vectorFields.length > 0) {
     const userQueryEmbedded = await generateEmbedding(userQuery);
     searchParameters.vectorSearchOptions = {
-      queries: [
-        {
+      queries: vectorFields.map((fieldName) => ({
           kind: "vector",
-          fields: [process.env.AZURE_SEARCH_VECTOR_FIELD], // Use the vector field from env vars
-          kNearestNeighborsCount: process.env.AZURE_SEARCH_SEMANTIC_CONFIGURATION_NAME ? 50 : 5,
+          fields: [fieldName],
+          kNearestNeighborsCount: semanticConfigurationName ? 50 : 8,
           vector: userQueryEmbedded,
-        },
-      ],
+        })),
     };
   }
 
   const searchResults = await searchClient.search(userQuery, searchParameters);
 
   const similarDocs: SearchDocument[] = [];
-  const contentColumn = process.env.AZURE_SEARCH_CONTENT_FIELD!;
   for await (const result of searchResults.results) {
     const document = result.document as Record<string, unknown>;
-    const rawTextField = Object.prototype.hasOwnProperty.call(document, contentColumn)
-      ? document[contentColumn]
-      : document;
+    const resolvedId = document[idField];
+    const title = typeof document[titleField] === "string" ? document[titleField] : undefined;
+    const sourceName =
+      typeof document.document_name === "string" ? document.document_name : undefined;
+    const sourceNumber =
+      typeof document.document_number === "string" ? document.document_number : undefined;
 
-    const textField =
-      typeof rawTextField === "string"
-        ? rawTextField
-        : JSON.stringify(rawTextField);
+    const contentParts = contentFields
+      .map((fieldName) => {
+        const value = document[fieldName];
+        if (typeof value === "string" && value.trim().length > 0) {
+          return `${fieldName}: ${value}`;
+        }
+        return "";
+      })
+      .filter(Boolean);
+
+    const textField = contentParts.join("\n");
 
     if (!textField) {
       continue;
     }
 
-    const hash = createHash("sha256")
-      .update(textField)
+    const generatedHash = createHash("sha256")
+      .update(`${sourceName ?? ""}|${sourceNumber ?? ""}|${textField}`)
       .digest("base64")
       .substring(0, 8);
+    const resultId =
+      typeof resolvedId === "string" && resolvedId.trim().length > 0
+        ? resolvedId
+        : generatedHash;
+    const rankingScore =
+      typeof result.rerankerScore === "number" ? result.rerankerScore : result.score;
 
     similarDocs.push({
       text: textField,
-      id: hash,
-      similarity: result.score,
+      id: resultId,
+      title,
+      sourceName,
+      sourceNumber,
+      similarity: rankingScore,
     });
   }
 
@@ -208,6 +261,9 @@ export const extractRelevantChunks = (
         uniqueChunks.set(normalizedChunk, {
           id: `${document.id}-${index + 1}`,
           text: chunkText,
+          title: document.title,
+          sourceName: document.sourceName,
+          sourceNumber: document.sourceNumber,
           score,
         });
       }
