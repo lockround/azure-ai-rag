@@ -50,7 +50,13 @@ const getLatestUserQuery = (messages: Message[]): string => {
 };
 
 const formatRetrievedContext = (
-  chunks: Array<{ id: string; text: string }>,
+  chunks: Array<{
+    id: string;
+    text: string;
+    title?: string;
+    sourceName?: string;
+    sourceNumber?: string;
+  }>,
   maxContextCharacters = 7000
 ): string => {
   if (chunks.length === 0) {
@@ -61,7 +67,12 @@ const formatRetrievedContext = (
   let currentLength = 0;
 
   for (const chunk of chunks) {
-    const section = `Source ID: ${chunk.id}\n${chunk.text}`;
+    const section = [
+      `Source ID: ${chunk.id}`,
+      `Title: ${chunk.title || "Unknown"}`,
+      `Document: ${chunk.sourceName || "Unknown"} (${chunk.sourceNumber || "N/A"})`,
+      chunk.text,
+    ].join("\n");
     if (currentLength + section.length > maxContextCharacters) {
       break;
     }
@@ -89,7 +100,8 @@ export async function POST(req: Request) {
       system: `You are a helpful assistant acting as the users' second brain.
       Use only the retrieved context and chat history to answer.
       If no relevant information is found in the retrieved context, respond exactly with "Sorry, I don't know."
-      Keep responses short and concise. Answer in a single sentence where possible.
+      Prefer evidence from "content", then use "objective" and "scope" to refine intent and constraints.
+      Keep responses concise but complete.
       Cite the sources using source ids at the end of the answer text, like 【234d987】, using the id of the source.
       If you cannot support an answer with the retrieved context, respond exactly with "Sorry, I don't know."
 
